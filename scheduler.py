@@ -3,33 +3,88 @@ from aiogram import Bot
 from datetime import datetime, timedelta, timezone
 import string
 
+import aiohttp
+
 from database import channels_col, logs_col
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
 
 def _suffix(seq: int) -> str:
-    """
-    Generate a deterministic 2-character suffix (aa, ab, ..., az, ba, ..., zz).
-    Provides up to 676 unique aliases per prefix, then wraps around.
-    """
     letters = string.ascii_lowercase
     seq = seq % (26 * 26)
     return letters[seq // 26] + letters[seq % 26]
+
+
+async def _try_shortener(url: str, alias: str | None, service: str) -> str | None:
+    """Return a shortened URL from one service, or None on failure."""
+    try:
+        async with aiohttp.ClientSession() as s:
+            if service == "isgd":
+                params = {"format": "simple", "url": url}
+                if alias:
+                    params["shorturl"] = alias
+                async with s.get(
+                    "https://is.gd/create.php",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    text = (await r.text()).strip()
+                    return text if text.startswith("http") else None
+
+            if service == "vgd":
+                params = {"format": "simple", "url": url}
+                if alias:
+                    params["shorturl"] = alias
+                async with s.get(
+                    "https://v.gd/create.php",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    text = (await r.text()).strip()
+                    return text if text.startswith("http") else None
+
+            if service == "tinyurl":
+                params = {"url": url}
+                if alias:
+                    params["alias"] = alias
+                async with s.get(
+                    "https://tinyurl.com/api-create.php",
+                    params=params,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as r:
+                    text = (await r.text()).strip()
+                    return text if text.startswith("http") else None
+    except Exception:
+        pass
+    return None
+
+
+async def shorten(url: str, alias: str | None = None) -> tuple[str, str]:
+    """
+    Try is.gd → v.gd → TinyURL.
+    Returns (short_url, provider).
+    If all fail, returns (url, "raw").
+    """
+    for service in ("isgd", "vgd", "tinyurl"):
+        short = await _try_shortener(url, alias, service)
+        if short and short != url:
+            return short, service
+    return url, "raw"
 
 
 async def rotate_link(bot: Bot, channel: dict):
     chat_id = channel["chat_id"]
     old_raw = channel.get("raw_link")
 
-    # 1. Revoke the previous raw Telegram invite link
+    # 1. Revoke previous raw invite
     if old_raw:
         try:
             await bot.revoke_chat_invite_link(chat_id=chat_id, invite_link=old_raw)
         except Exception:
             pass
 
-    # 2. Create a new raw Telegram invite link (no approval required)
+    # 2. Create a new raw invite
     expire = datetime.now(timezone.utc) + timedelta(
         seconds=channel["interval_seconds"] * 2
     )
@@ -52,19 +107,16 @@ async def rotate_link(bot: Bot, channel: dict):
 
     raw_link = result.invite_link
     display_link = raw_link
+    provider = "raw"
 
-    # 3. If a short prefix is configured, shorten the new raw link
+    # 3. Shorten if configured
     prefix = channel.get("short_prefix")
     if prefix:
-        from handlers_all import shorten
         seq = channel.get("short_seq", 0)
         alias = f"{prefix}{_suffix(seq)}"
-        short = await shorten(raw_link, alias=alias)
-        if short and short != raw_link:
-            display_link = short
+        display_link, provider = await shorten(raw_link, alias=alias)
 
-    # 4. Persist the new state
-    new_seq = channel.get("short_seq", 0) + 1
+    # 4. Persist
     await channels_col.update_one(
         {"_id": channel["_id"]},
         {
@@ -72,22 +124,21 @@ async def rotate_link(bot: Bot, channel: dict):
                 "current_link": display_link,
                 "raw_link": raw_link,
                 "link_created_at": datetime.now(timezone.utc),
-                "short_seq": new_seq,
+                "short_seq": channel.get("short_seq", 0) + 1,
+                "last_provider": provider,
             }
         },
     )
-
     await logs_col.insert_one({
         "actor_id": 0,
         "action": "rotate_link",
         "channel_id": chat_id,
-        "detail": {"display": display_link, "raw": raw_link},
+        "detail": {"display": display_link, "raw": raw_link, "provider": provider},
         "timestamp": datetime.now(timezone.utc),
     })
 
 
 def add_rotation_job(bot: Bot, channel: dict):
-    """Add or replace a channel's rotation job (fixed ID prevents duplicates)."""
     job_id = f"rotate_{channel['chat_id']}"
     scheduler.add_job(
         rotate_link,
@@ -109,6 +160,5 @@ def remove_rotation_job(chat_id: int):
 
 
 async def restore_all_jobs(bot: Bot):
-    """Rebuild every enabled channel's rotation job on startup."""
     async for ch in channels_col.find({"enabled": True}):
         add_rotation_job(bot, ch)
