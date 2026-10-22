@@ -5,6 +5,7 @@ from database import users_col, channels_col, logs_col
 from scheduler import scheduler
 
 router = Router()
+# ... cmd_dashboard ...
 
 @router.message(Command("dashboard"))
 async def cmd_dashboard(message: types.Message):
