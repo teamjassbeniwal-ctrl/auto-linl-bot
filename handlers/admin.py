@@ -5,6 +5,7 @@ from database import users_col, logs_col
 from datetime import datetime, timezone
 
 router = Router()
+# ... cmd_addadmin, cmd_removeadmin, cmd_adminlist ...
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
