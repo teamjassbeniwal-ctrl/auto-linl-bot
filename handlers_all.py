@@ -1,11 +1,16 @@
 """
 All Telegram handlers for the Auto-Link Bot.
-Flat single-module design (no handlers/ package).
+Single-module design (no handlers/ package).
+
+Public channels are visible to every user via /start and /channels.
+Private channels are only visible to their owner and assigned admins.
 """
 
 import asyncio
+import urllib.parse
 from datetime import datetime, timezone
 
+import aiohttp
 from aiogram import Router, types
 from aiogram.filters import Command, CommandStart
 from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
@@ -36,18 +41,56 @@ async def can_manage(user_id: int, chat_id: int) -> bool:
 
 async def visible_to(user_id: int):
     """
-    Return channels the given user should see under /start:
-      - every channel they own or are assigned to, PLUS
-      - every channel marked public.
+    Channels the user should see on /start:
+      - any channel they own or are assigned to
+      - every channel NOT explicitly marked private
     """
     return await channels_col.find({
         "enabled": True,
         "$or": [
             {"owner_id": user_id},
             {"assigned_admins": user_id},
-            {"visibility": "public"},
+            {"visibility": {"$ne": "private"}},
         ],
     }).to_list(None)
+
+
+async def shorten(url: str, alias: str | None = None) -> str:
+    """
+    Shorten a Telegram invite link.
+    Primary: is.gd (free, no key, supports custom alias).
+    Fallback: v.gd (same API).
+    Returns the short URL, or the original URL on failure.
+    """
+    base = "https://is.gd/create.php"
+    params = {"format": "simple", "url": url}
+    if alias:
+        params["shorturl"] = alias
+
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(base, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                text = (await r.text()).strip()
+                if text.startswith("http"):
+                    return text
+    except Exception:
+        pass
+
+    # Fallback v.gd
+    try:
+        async with aiohttp.ClientSession() as s:
+            async with s.get(
+                "https://v.gd/create.php",
+                params=params,
+                timeout=aiohttp.ClientTimeout(total=10),
+            ) as r:
+                text = (await r.text()).strip()
+                if text.startswith("http"):
+                    return text
+    except Exception:
+        pass
+
+    return url  # fall back to raw Telegram link
 
 
 # ────────────────────────────────────────────────────────────────
@@ -116,13 +159,12 @@ async def view_channel(callback: types.CallbackQuery):
     chat_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
 
-    # Same rule as /start: own/assigned OR public
     ch = await channels_col.find_one({
         "chat_id": chat_id,
         "$or": [
             {"owner_id": user_id},
             {"assigned_admins": user_id},
-            {"visibility": "public"},
+            {"visibility": {"$ne": "private"}},
         ],
     })
     if not ch:
@@ -151,6 +193,39 @@ async def view_channel(callback: types.CallbackQuery):
 
 
 # ────────────────────────────────────────────────────────────────
+# /channels — browse every public channel
+# ────────────────────────────────────────────────────────────────
+
+@router.message(Command("channels"))
+async def cmd_channels(message: types.Message):
+    channels = await channels_col.find({
+        "enabled": True,
+        "visibility": {"$ne": "private"},
+    }).to_list(None)
+
+    if not channels:
+        await message.answer("No public channels available right now.")
+        return
+
+    # One inline button per channel — up to 20 fits comfortably on any screen.
+    buttons = [
+        [InlineKeyboardButton(text=ch["title"], url=ch["current_link"])]
+        for ch in channels
+        if ch.get("current_link")
+    ]
+    if not buttons:
+        await message.answer("Channels exist but no invite links are available yet.")
+        return
+
+    await message.answer(
+        "📢 <b>Available Public Channels</b>\n\nTap one to join:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        parse_mode="HTML",
+        disable_web_page_preview=True,
+    )
+
+
+# ────────────────────────────────────────────────────────────────
 # /help
 # ────────────────────────────────────────────────────────────────
 
@@ -160,6 +235,7 @@ async def cmd_help(message: types.Message):
         "📖 <b>Auto-Link Bot — Command Reference</b>\n\n"
         "👤 <b>Everyone</b>\n"
         "/start — Show the current invite link(s)\n"
+        "/channels — List all public channels\n"
         "/help — Show this help message\n"
         "/mychannels — List channels you own or are assigned to\n"
         "/status — Show status of the channels you manage\n\n"
@@ -170,7 +246,9 @@ async def cmd_help(message: types.Message):
         "/settime CHAT_ID VALUE — Change rotation interval (5m / 10m / 1h / 24h / seconds)\n"
         "/setlink CHAT_ID LINK — Manually override the link (owner only)\n"
         "/setpublic CHAT_ID — Make a channel visible to everyone\n"
-        "/setprivate CHAT_ID — Hide a channel from non-owners/admins\n\n"
+        "/setprivate CHAT_ID — Hide a channel from non-owners/admins\n"
+        "/setshort CHAT_ID PREFIX — Enable short-link rotation with a prefix\n"
+        "/setrawlink CHAT_ID — Turn off short-link rotation\n\n"
     )
     if is_owner(message.from_user.id):
         text += (
@@ -234,13 +312,6 @@ async def cmd_broadcast(message: types.Message):
         f"👥 Total: {total}",
         parse_mode="HTML",
     )
-    await logs_col.insert_one({
-        "actor_id": message.from_user.id,
-        "action": "broadcast",
-        "channel_id": None,
-        "detail": {"sent": sent, "failed": failed, "total": total},
-        "timestamp": datetime.now(timezone.utc),
-    })
 
 
 # ────────────────────────────────────────────────────────────────
@@ -318,6 +389,7 @@ async def cmd_addchannel(message: types.Message):
         link_result = await message.bot.create_chat_invite_link(
             chat_id=chat.id,
             name=f"init-{int(datetime.now().timestamp())}",
+            creates_join_request=False,      # ← approval-free link
         )
     except Exception as e:
         await message.answer(f"❌ Could not create an invite link: {e}")
@@ -328,28 +400,25 @@ async def cmd_addchannel(message: types.Message):
         "title": chat.title,
         "owner_id": message.from_user.id,
         "current_link": link_result.invite_link,
+        "raw_link": link_result.invite_link,          # ← raw for revocation
         "link_created_at": datetime.now(timezone.utc),
         "interval_seconds": 300,
         "enabled": True,
-        "visibility": "public",     # ← NEW — every /addchannel is public by default
+        "visibility": "public",
+        "short_prefix": None,                          # ← for short-link rotation
+        "short_seq": 0,
         "assigned_admins": [],
     }
     await channels_col.insert_one(doc)
     add_rotation_job(message.bot, doc)
 
-    await logs_col.insert_one({
-        "actor_id": message.from_user.id,
-        "action": "add_channel",
-        "channel_id": chat.id,
-        "detail": {"title": chat.title},
-        "timestamp": datetime.now(timezone.utc),
-    })
     await message.answer(
         f"✅ Channel added: <b>{chat.title}</b>\n"
         f"🔗 Initial link: {link_result.invite_link}\n"
         f"⏱ Default interval: 5 minutes\n"
-        f"👁 Visibility: public — every user who sends /start will see this link.\n"
-        f"Use /setprivate to hide it, /settime to change interval.",
+        f"👁 Visibility: public\n\n"
+        f"Optional: enable short-link rotation with\n"
+        f"<code>/setshort {chat.id} {chat.username or 'prefix'}_2027</code>",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -387,11 +456,13 @@ async def cmd_mychannels(message: types.Message):
     for ch in channels:
         status = "🟢" if ch["enabled"] else "🔴"
         vis = ch.get("visibility", "public")
+        sp = ch.get("short_prefix") or "—"
         lines.append(
             f"{status} <b>{ch['title']}</b>\n"
             f"   Chat ID: <code>{ch['chat_id']}</code>\n"
             f"   Interval: {ch['interval_seconds']} s\n"
             f"   Visibility: {vis}\n"
+            f"   Short prefix: {sp}\n"
             f"   Link: {ch.get('current_link', 'N/A')}\n"
         )
     await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
@@ -466,14 +537,11 @@ async def cmd_setpublic(message: types.Message):
         return
     chat_id = int(parts[1])
     ch = await channels_col.find_one({"chat_id": chat_id})
-    if not ch:
-        await message.answer("❌ Channel not found.")
-        return
-    if ch["owner_id"] != message.from_user.id:
+    if not ch or ch["owner_id"] != message.from_user.id:
         await message.answer("⛔ Only the channel owner can change visibility.")
         return
     await channels_col.update_one({"chat_id": chat_id}, {"$set": {"visibility": "public"}})
-    await message.answer("✅ Channel is now public — all users who send /start will see it.")
+    await message.answer("✅ Channel is now public.")
 
 
 @router.message(Command("setprivate"))
@@ -484,14 +552,78 @@ async def cmd_setprivate(message: types.Message):
         return
     chat_id = int(parts[1])
     ch = await channels_col.find_one({"chat_id": chat_id})
-    if not ch:
-        await message.answer("❌ Channel not found.")
-        return
-    if ch["owner_id"] != message.from_user.id:
+    if not ch or ch["owner_id"] != message.from_user.id:
         await message.answer("⛔ Only the channel owner can change visibility.")
         return
     await channels_col.update_one({"chat_id": chat_id}, {"$set": {"visibility": "private"}})
-    await message.answer("✅ Channel is now private — only you and its assigned admins will see it.")
+    await message.answer("✅ Channel is now private.")
+
+
+@router.message(Command("setshort"))
+async def cmd_setshort(message: types.Message):
+    """
+    Enable short-link rotation.
+    Usage: /setshort CHAT_ID PREFIX
+    Example: /setshort -1002888391802 pw_yakeen_2_NEET_Lectures_2027
+    Each rotation will produce:
+      https://is.gd/<PREFIX>cl   (custom alias, 2-char suffix)
+      https://is.gd/<PREFIX>da
+      ...
+    """
+    parts = message.text.split(maxsplit=2)
+    if len(parts) != 3:
+        await message.answer(
+            "Usage: <code>/setshort CHAT_ID PREFIX</code>\n\n"
+            "Example:\n"
+            "<code>/setshort -1002888391802 pw_yakeen_2_NEET_Lectures_2027</code>",
+            parse_mode="HTML",
+        )
+        return
+    try:
+        chat_id = int(parts[1])
+    except ValueError:
+        await message.answer("❌ CHAT_ID must be a number.")
+        return
+    ch = await channels_col.find_one({"chat_id": chat_id})
+    if not ch or ch["owner_id"] != message.from_user.id:
+        await message.answer("⛔ Only the channel owner can configure short links.")
+        return
+    prefix = parts[2].strip()
+    if len(prefix) < 5 or len(prefix) > 20:
+        await message.answer(
+            "❌ Prefix must be between 5 and 20 characters "
+            "(is.gd requires 5–30, we cap at 20 to leave room for the suffix)."
+        )
+        return
+    await channels_col.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"short_prefix": prefix, "short_seq": 0}},
+    )
+    await message.answer(
+        f"✅ Short-link rotation enabled.\n"
+        f"Prefix: <code>{prefix}</code>\n"
+        f"Next rotation will produce:\n"
+        f"<code>https://is.gd/{prefix}aa</code>",
+        parse_mode="HTML",
+    )
+
+
+@router.message(Command("setrawlink"))
+async def cmd_setrawlink(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Usage: /setrawlink CHAT_ID")
+        return
+    chat_id = int(parts[1])
+    ch = await channels_col.find_one({"chat_id": chat_id})
+    if not ch or ch["owner_id"] != message.from_user.id:
+        await message.answer("⛔ Only the channel owner can change link mode.")
+        return
+    await channels_col.update_one(
+        {"chat_id": chat_id},
+        {"$set": {"short_prefix": None, "short_seq": 0}},
+    )
+    await message.answer("✅ Short-link rotation disabled. Raw Telegram links will be used.")
 
 
 @router.message(Command("status"))
@@ -507,12 +639,14 @@ async def cmd_status(message: types.Message):
     for ch in channels:
         status = "🟢 Enabled" if ch["enabled"] else "🔴 Disabled"
         vis = ch.get("visibility", "public")
+        sp = ch.get("short_prefix") or "off"
         lines.append(
             f"<b>{ch['title']}</b>\n"
             f"  Status: {status}\n"
             f"  Visibility: {vis}\n"
             f"  Interval: {ch['interval_seconds']} s\n"
-            f"  Link created at: {ch.get('link_created_at', 'Unknown')}\n"
+            f"  Short prefix: {sp}\n"
+            f"  Current: {ch.get('current_link', 'N/A')}\n"
         )
     await message.answer("\n".join(lines), parse_mode="HTML")
 
@@ -530,7 +664,7 @@ async def cmd_dashboard(message: types.Message):
     total_users = await users_col.count_documents({})
     total_channels = await channels_col.count_documents({})
     enabled_channels = await channels_col.count_documents({"enabled": True})
-    public_channels = await channels_col.count_documents({"visibility": "public"})
+    public_channels = await channels_col.count_documents({"visibility": {"$ne": "private"}})
     jobs = scheduler.get_jobs()
     recent = await logs_col.find().sort("timestamp", -1).limit(10).to_list(None)
 
