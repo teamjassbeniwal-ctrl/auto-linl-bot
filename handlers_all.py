@@ -1,7 +1,6 @@
 """
 All Telegram handlers for the Auto-Link Bot.
-Kept in a single flat module to avoid package import issues
-(no handlers/ package, no __init__.py, no __path__ resolution).
+Flat single-module design (no handlers/ package).
 """
 
 import asyncio
@@ -35,6 +34,22 @@ async def can_manage(user_id: int, chat_id: int) -> bool:
     return ch is not None
 
 
+async def visible_to(user_id: int):
+    """
+    Return channels the given user should see under /start:
+      - every channel they own or are assigned to, PLUS
+      - every channel marked public.
+    """
+    return await channels_col.find({
+        "enabled": True,
+        "$or": [
+            {"owner_id": user_id},
+            {"assigned_admins": user_id},
+            {"visibility": "public"},
+        ],
+    }).to_list(None)
+
+
 # ────────────────────────────────────────────────────────────────
 # /start
 # ────────────────────────────────────────────────────────────────
@@ -56,25 +71,24 @@ async def cmd_start(message: types.Message):
         "timestamp": datetime.now(timezone.utc),
     })
 
-    accessible = await channels_col.find({
-        "$or": [
-            {"owner_id": user_id},
-            {"assigned_admins": user_id},
-        ],
-        "enabled": True,
-    }).to_list(None)
+    channels = await visible_to(user_id)
 
-    if not accessible:
+    if not channels:
         await message.answer(
             "👋 Welcome to Auto-Link Bot!\n\n"
-            "You are not managing any channels yet.\n"
-            "Use /addchannel to add one, or /help to see all commands."
+            "No public channels are available right now.\n"
+            "If you own a channel, use /addchannel to register it."
         )
         return
 
-    if len(accessible) == 1:
-        ch = accessible[0]
-        link = ch.get("current_link", "Link not generated yet")
+    if len(channels) == 1:
+        ch = channels[0]
+        link = ch.get("current_link")
+        if not link:
+            await message.answer(
+                "❌ Link not found for this channel yet. Please try again in a moment."
+            )
+            return
         kb = InlineKeyboardMarkup(inline_keyboard=[[
             InlineKeyboardButton(text="🚀 Join Channel", url=link)
         ]])
@@ -89,7 +103,7 @@ async def cmd_start(message: types.Message):
     else:
         buttons = [
             [InlineKeyboardButton(text=ch["title"], callback_data=f"view_ch:{ch['chat_id']}")]
-            for ch in accessible
+            for ch in channels
         ]
         await message.answer(
             "📢 Please select a channel:",
@@ -102,15 +116,27 @@ async def view_channel(callback: types.CallbackQuery):
     chat_id = int(callback.data.split(":")[1])
     user_id = callback.from_user.id
 
+    # Same rule as /start: own/assigned OR public
     ch = await channels_col.find_one({
         "chat_id": chat_id,
-        "$or": [{"owner_id": user_id}, {"assigned_admins": user_id}],
+        "$or": [
+            {"owner_id": user_id},
+            {"assigned_admins": user_id},
+            {"visibility": "public"},
+        ],
     })
     if not ch:
         await callback.answer("Access denied.", show_alert=True)
         return
 
-    link = ch.get("current_link", "Link not generated yet")
+    link = ch.get("current_link")
+    if not link:
+        await callback.answer(
+            "❌ Link not found for this channel yet. Please try again in a moment.",
+            show_alert=True,
+        )
+        return
+
     kb = InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="🚀 Join Channel", url=link)
     ]])
@@ -133,16 +159,18 @@ async def cmd_help(message: types.Message):
     text = (
         "📖 <b>Auto-Link Bot — Command Reference</b>\n\n"
         "👤 <b>Everyone</b>\n"
-        "/start — Show the current invite link of your channel(s)\n"
+        "/start — Show the current invite link(s)\n"
         "/help — Show this help message\n"
         "/mychannels — List channels you own or are assigned to\n"
         "/status — Show status of the channels you manage\n\n"
         "📢 <b>Channel Management</b> (owner or assigned admin)\n"
-        "/addchannel @username — Register a channel\n"
+        "/addchannel @username — Register a channel (public by default)\n"
         "/addchannel -100xxxxxxxxxx — Register by chat ID\n"
         "/removechannel CHAT_ID — Unregister a channel (owner only)\n"
         "/settime CHAT_ID VALUE — Change rotation interval (5m / 10m / 1h / 24h / seconds)\n"
-        "/setlink CHAT_ID LINK — Manually override the link (owner only)\n\n"
+        "/setlink CHAT_ID LINK — Manually override the link (owner only)\n"
+        "/setpublic CHAT_ID — Make a channel visible to everyone\n"
+        "/setprivate CHAT_ID — Hide a channel from non-owners/admins\n\n"
     )
     if is_owner(message.from_user.id):
         text += (
@@ -157,7 +185,7 @@ async def cmd_help(message: types.Message):
         "🔗 <b>Quick start</b>\n"
         "1. /addchannel @my_channel\n"
         "2. /settime -1001234567890 10m\n"
-        "3. Share the bot with your audience → they send /start\n"
+        "3. Share the bot → users send /start and see your link\n"
     )
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -174,14 +202,10 @@ async def cmd_broadcast(message: types.Message):
 
     parts = message.text.split(maxsplit=1)
     if len(parts) != 2 or not parts[1].strip():
-        await message.answer(
-            "Usage: <code>/broadcast YOUR MESSAGE</code>",
-            parse_mode="HTML",
-        )
+        await message.answer("Usage: <code>/broadcast YOUR MESSAGE</code>", parse_mode="HTML")
         return
 
     body = parts[1].strip()
-
     user_ids = []
     async for u in users_col.find({}, {"telegram_id": 1}):
         uid = u.get("telegram_id")
@@ -220,7 +244,7 @@ async def cmd_broadcast(message: types.Message):
 
 
 # ────────────────────────────────────────────────────────────────
-# /addadmin /removeadmin /adminlist — Owner only
+# Admin commands — Owner only
 # ────────────────────────────────────────────────────────────────
 
 @router.message(Command("addadmin"))
@@ -233,18 +257,7 @@ async def cmd_addadmin(message: types.Message):
         await message.answer("Usage: /addadmin USER_ID")
         return
     target = int(parts[1])
-    await users_col.update_one(
-        {"telegram_id": target},
-        {"$set": {"role": "admin"}},
-        upsert=True,
-    )
-    await logs_col.insert_one({
-        "actor_id": message.from_user.id,
-        "action": "add_admin",
-        "channel_id": None,
-        "detail": {"target": target},
-        "timestamp": datetime.now(timezone.utc),
-    })
+    await users_col.update_one({"telegram_id": target}, {"$set": {"role": "admin"}}, upsert=True)
     await message.answer(f"✅ Admin added: <code>{target}</code>", parse_mode="HTML")
 
 
@@ -259,13 +272,6 @@ async def cmd_removeadmin(message: types.Message):
         return
     target = int(parts[1])
     await users_col.update_one({"telegram_id": target}, {"$set": {"role": "user"}})
-    await logs_col.insert_one({
-        "actor_id": message.from_user.id,
-        "action": "remove_admin",
-        "channel_id": None,
-        "detail": {"target": target},
-        "timestamp": datetime.now(timezone.utc),
-    })
     await message.answer(f"✅ Admin removed: <code>{target}</code>", parse_mode="HTML")
 
 
@@ -278,9 +284,7 @@ async def cmd_adminlist(message: types.Message):
     if not admins:
         await message.answer("No admins configured.")
         return
-    lines = ["👑 <b>Admin List</b>\n"] + [
-        f"• <code>{a['telegram_id']}</code>" for a in admins
-    ]
+    lines = ["👑 <b>Admin List</b>\n"] + [f"• <code>{a['telegram_id']}</code>" for a in admins]
     await message.answer("\n".join(lines), parse_mode="HTML")
 
 
@@ -327,6 +331,7 @@ async def cmd_addchannel(message: types.Message):
         "link_created_at": datetime.now(timezone.utc),
         "interval_seconds": 300,
         "enabled": True,
+        "visibility": "public",     # ← NEW — every /addchannel is public by default
         "assigned_admins": [],
     }
     await channels_col.insert_one(doc)
@@ -343,7 +348,8 @@ async def cmd_addchannel(message: types.Message):
         f"✅ Channel added: <b>{chat.title}</b>\n"
         f"🔗 Initial link: {link_result.invite_link}\n"
         f"⏱ Default interval: 5 minutes\n"
-        f"Use /settime to change it.",
+        f"👁 Visibility: public — every user who sends /start will see this link.\n"
+        f"Use /setprivate to hide it, /settime to change interval.",
         parse_mode="HTML",
         disable_web_page_preview=True,
     )
@@ -380,10 +386,12 @@ async def cmd_mychannels(message: types.Message):
     lines = ["📋 <b>Your Channels</b>\n"]
     for ch in channels:
         status = "🟢" if ch["enabled"] else "🔴"
+        vis = ch.get("visibility", "public")
         lines.append(
             f"{status} <b>{ch['title']}</b>\n"
             f"   Chat ID: <code>{ch['chat_id']}</code>\n"
             f"   Interval: {ch['interval_seconds']} s\n"
+            f"   Visibility: {vis}\n"
             f"   Link: {ch.get('current_link', 'N/A')}\n"
         )
     await message.answer("\n".join(lines), parse_mode="HTML", disable_web_page_preview=True)
@@ -393,10 +401,7 @@ async def cmd_mychannels(message: types.Message):
 async def cmd_settime(message: types.Message):
     parts = message.text.split()
     if len(parts) != 3:
-        await message.answer(
-            "Usage: /settime CHAT_ID SECONDS\n"
-            "Shortcuts: 5m / 10m / 1h / 24h"
-        )
+        await message.answer("Usage: /settime CHAT_ID SECONDS\nShortcuts: 5m / 10m / 1h / 24h")
         return
     try:
         chat_id = int(parts[1])
@@ -453,6 +458,42 @@ async def cmd_setlink(message: types.Message):
     await message.answer("✅ Link updated.")
 
 
+@router.message(Command("setpublic"))
+async def cmd_setpublic(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Usage: /setpublic CHAT_ID")
+        return
+    chat_id = int(parts[1])
+    ch = await channels_col.find_one({"chat_id": chat_id})
+    if not ch:
+        await message.answer("❌ Channel not found.")
+        return
+    if ch["owner_id"] != message.from_user.id:
+        await message.answer("⛔ Only the channel owner can change visibility.")
+        return
+    await channels_col.update_one({"chat_id": chat_id}, {"$set": {"visibility": "public"}})
+    await message.answer("✅ Channel is now public — all users who send /start will see it.")
+
+
+@router.message(Command("setprivate"))
+async def cmd_setprivate(message: types.Message):
+    parts = message.text.split()
+    if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
+        await message.answer("Usage: /setprivate CHAT_ID")
+        return
+    chat_id = int(parts[1])
+    ch = await channels_col.find_one({"chat_id": chat_id})
+    if not ch:
+        await message.answer("❌ Channel not found.")
+        return
+    if ch["owner_id"] != message.from_user.id:
+        await message.answer("⛔ Only the channel owner can change visibility.")
+        return
+    await channels_col.update_one({"chat_id": chat_id}, {"$set": {"visibility": "private"}})
+    await message.answer("✅ Channel is now private — only you and its assigned admins will see it.")
+
+
 @router.message(Command("status"))
 async def cmd_status(message: types.Message):
     channels = await channels_col.find({
@@ -465,9 +506,11 @@ async def cmd_status(message: types.Message):
     lines = ["📊 <b>Channel Status</b>\n"]
     for ch in channels:
         status = "🟢 Enabled" if ch["enabled"] else "🔴 Disabled"
+        vis = ch.get("visibility", "public")
         lines.append(
             f"<b>{ch['title']}</b>\n"
             f"  Status: {status}\n"
+            f"  Visibility: {vis}\n"
             f"  Interval: {ch['interval_seconds']} s\n"
             f"  Link created at: {ch.get('link_created_at', 'Unknown')}\n"
         )
@@ -487,6 +530,7 @@ async def cmd_dashboard(message: types.Message):
     total_users = await users_col.count_documents({})
     total_channels = await channels_col.count_documents({})
     enabled_channels = await channels_col.count_documents({"enabled": True})
+    public_channels = await channels_col.count_documents({"visibility": "public"})
     jobs = scheduler.get_jobs()
     recent = await logs_col.find().sort("timestamp", -1).limit(10).to_list(None)
 
@@ -495,6 +539,7 @@ async def cmd_dashboard(message: types.Message):
         f"👥 Registered users: {total_users}",
         f"📢 Total channels: {total_channels}",
         f"🟢 Enabled channels: {enabled_channels}",
+        f"🌐 Public channels: {public_channels}",
         f"⚙️ Scheduled jobs: {len(jobs)}\n",
         "<b>Recent activity:</b>",
     ]
