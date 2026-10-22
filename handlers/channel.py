@@ -6,7 +6,7 @@ from config import INTERVAL_OPTIONS
 from datetime import datetime, timezone
 
 router = Router()
-
+# ... cmd_addchannel, cmd_removechannel, cmd_mychannels, cmd_settime, cmd_setlink, cmd_status ...
 async def can_manage(user_id: int, chat_id: int) -> bool:
     """Check if the user owns or is assigned to the channel."""
     ch = await channels_col.find_one({
