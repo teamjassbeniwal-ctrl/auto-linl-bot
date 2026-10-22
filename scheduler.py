@@ -1,8 +1,9 @@
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from aiogram import Bot
 from datetime import datetime, timedelta, timezone
-from database import channels_col, logs_col
 import string
+
+from database import channels_col, logs_col
 
 scheduler = AsyncIOScheduler(timezone="UTC")
 
@@ -10,11 +11,10 @@ scheduler = AsyncIOScheduler(timezone="UTC")
 def _suffix(seq: int) -> str:
     """
     Generate a deterministic 2-character suffix (aa, ab, ..., az, ba, ..., zz).
-    Provides up to 676 unique aliases per prefix.
+    Provides up to 676 unique aliases per prefix, then wraps around.
     """
     letters = string.ascii_lowercase
-    if seq >= 26 * 26:
-        seq = seq % (26 * 26)
+    seq = seq % (26 * 26)
     return letters[seq // 26] + letters[seq % 26]
 
 
@@ -30,7 +30,9 @@ async def rotate_link(bot: Bot, channel: dict):
             pass
 
     # 2. Create a new raw Telegram invite link (no approval required)
-    expire = datetime.now(timezone.utc) + timedelta(seconds=channel["interval_seconds"] * 2)
+    expire = datetime.now(timezone.utc) + timedelta(
+        seconds=channel["interval_seconds"] * 2
+    )
     try:
         result = await bot.create_chat_invite_link(
             chat_id=chat_id,
@@ -51,7 +53,7 @@ async def rotate_link(bot: Bot, channel: dict):
     raw_link = result.invite_link
     display_link = raw_link
 
-    # 3. If short-prefix is set, shorten the new raw link
+    # 3. If a short prefix is configured, shorten the new raw link
     prefix = channel.get("short_prefix")
     if prefix:
         from handlers_all import shorten
@@ -60,18 +62,21 @@ async def rotate_link(bot: Bot, channel: dict):
         short = await shorten(raw_link, alias=alias)
         if short and short != raw_link:
             display_link = short
-        # advance the sequence for the next rotation
-        seq = seq + 1
 
-    # 4. Persist    await channels_col.update_one(
+    # 4. Persist the new state
+    new_seq = channel.get("short_seq", 0) + 1
+    await channels_col.update_one(
         {"_id": channel["_id"]},
-        {"$set": {
-            "current_link": display_link,
-            "raw_link": raw_link,
-            "link_created_at": datetime.now(timezone.utc),
-            "short_seq": channel.get("short_seq", 0) + 1,
-        }},
+        {
+            "$set": {
+                "current_link": display_link,
+                "raw_link": raw_link,
+                "link_created_at": datetime.now(timezone.utc),
+                "short_seq": new_seq,
+            }
+        },
     )
+
     await logs_col.insert_one({
         "actor_id": 0,
         "action": "rotate_link",
@@ -82,6 +87,7 @@ async def rotate_link(bot: Bot, channel: dict):
 
 
 def add_rotation_job(bot: Bot, channel: dict):
+    """Add or replace a channel's rotation job (fixed ID prevents duplicates)."""
     job_id = f"rotate_{channel['chat_id']}"
     scheduler.add_job(
         rotate_link,
@@ -103,5 +109,6 @@ def remove_rotation_job(chat_id: int):
 
 
 async def restore_all_jobs(bot: Bot):
+    """Rebuild every enabled channel's rotation job on startup."""
     async for ch in channels_col.find({"enabled": True}):
         add_rotation_job(bot, ch)
