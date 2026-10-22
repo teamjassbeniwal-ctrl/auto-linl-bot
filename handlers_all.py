@@ -1,13 +1,21 @@
 """
-All Telegram handlers for the Auto-Link Bot.
-Single-module design (no handlers/ package).
+Auto-Link Bot — all handlers in one flat module.
 
-Public channels are visible to every user via /start and /channels.
-Private channels are only visible to their owner and assigned admins.
+Role rules:
+  - Owner and Admins may run every command.
+  - Regular users may run ONLY /start.
+    Any other command replies "not authorized".
+
+/start behavior:
+  - Owner / Admin → NEVER shows their own channels.
+                    Shows ONLY public channels of OTHER users.
+                    If none exist → "No public channels are available right now."
+  - Regular user  → shows ALL public channels.
+  - If no public channels exist for a regular user
+    → "No public channels are available right now."
 """
 
 import asyncio
-import urllib.parse
 from datetime import datetime, timezone
 
 import aiohttp
@@ -24,11 +32,23 @@ router = Router()
 
 
 # ────────────────────────────────────────────────────────────────
-# Helpers
+# Role helpers
 # ────────────────────────────────────────────────────────────────
 
 def is_owner(user_id: int) -> bool:
     return user_id == OWNER_ID
+
+
+async def is_admin(user_id: int) -> bool:
+    doc = await users_col.find_one({"telegram_id": user_id, "role": "admin"})
+    return doc is not None
+
+
+async def has_privileged_role(user_id: int) -> bool:
+    """Owner or Admin → may use every command."""
+    if is_owner(user_id):
+        return True
+    return await is_admin(user_id)
 
 
 async def can_manage(user_id: int, chat_id: int) -> bool:
@@ -39,58 +59,60 @@ async def can_manage(user_id: int, chat_id: int) -> bool:
     return ch is not None
 
 
-async def visible_to(user_id: int):
+# ────────────────────────────────────────────────────────────────
+# Authorization gate — runs before every command except /start
+# ────────────────────────────────────────────────────────────────
+
+GATE_EXEMPT = {"start"}  # /start is always allowed
+
+
+async def _role_gate(message: types.Message) -> bool:
     """
-    Channels the user should see on /start:
-      - any channel they own or are assigned to
-      - every channel NOT explicitly marked private
+    Returns True if the caller may proceed, False if we already replied.
     """
-    return await channels_col.find({
+    # Skip commands that don't start with '/'
+    if not message.text or not message.text.startswith("/"):
+        return True
+
+    # Extract command name (e.g. "/help@MyBot" → "help")
+    cmd = message.text.split()[0][1:].split("@")[0].lower()
+    if cmd in GATE_EXEMPT:
+        return True
+
+    if await has_privileged_role(message.from_user.id):
+        return True
+
+    await message.answer(
+        "⛔ You are not authorized to use this command.\n\n"
+        "Only the bot Owner and Admins can manage channels.\n"
+        "Send /start to see available channels."
+    )
+    return False
+
+
+# ────────────────────────────────────────────────────────────────
+# Visibility helpers
+# ────────────────────────────────────────────────────────────────
+
+async def public_channels_for(user_id: int, exclude_own: bool):
+    """
+    Return the list of public channels this user should see.
+
+    If exclude_own is True (Owner/Admin), skip channels they own or are
+    assigned to — so owners always see "no public channels" for /start
+    unless another user has added a public channel.
+    """
+    query = {
         "enabled": True,
-        "$or": [
-            {"owner_id": user_id},
-            {"assigned_admins": user_id},
-            {"visibility": {"$ne": "private"}},
-        ],
-    }).to_list(None)
-
-
-async def shorten(url: str, alias: str | None = None) -> str:
-    """
-    Shorten a Telegram invite link.
-    Primary: is.gd (free, no key, supports custom alias).
-    Fallback: v.gd (same API).
-    Returns the short URL, or the original URL on failure.
-    """
-    base = "https://is.gd/create.php"
-    params = {"format": "simple", "url": url}
-    if alias:
-        params["shorturl"] = alias
-
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(base, params=params, timeout=aiohttp.ClientTimeout(total=10)) as r:
-                text = (await r.text()).strip()
-                if text.startswith("http"):
-                    return text
-    except Exception:
-        pass
-
-    # Fallback v.gd
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get(
-                "https://v.gd/create.php",
-                params=params,
-                timeout=aiohttp.ClientTimeout(total=10),
-            ) as r:
-                text = (await r.text()).strip()
-                if text.startswith("http"):
-                    return text
-    except Exception:
-        pass
-
-    return url  # fall back to raw Telegram link
+        "visibility": {"$ne": "private"},
+        "current_link": {"$exists": True, "$ne": None},
+    }
+    if exclude_own:
+        query["$and"] = [
+            {"owner_id": {"$ne": user_id}},
+            {"assigned_admins": {"$ne": user_id}},
+        ]
+    return await channels_col.find(query).to_list(None)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -114,31 +136,35 @@ async def cmd_start(message: types.Message):
         "timestamp": datetime.now(timezone.utc),
     })
 
-    channels = await visible_to(user_id)
+    privileged = await has_privileged_role(user_id)
+    channels = await public_channels_for(user_id, exclude_own=privileged)
 
     if not channels:
-        await message.answer(
-            "👋 Welcome to Auto-Link Bot!\n\n"
-            "No public channels are available right now.\n"
-            "If you own a channel, use /addchannel to register it."
-        )
+        # Owner/Admin: hint to add a channel. Regular user: same text.
+        if privileged:
+            await message.answer(
+                "👋 Welcome to Auto-Link Bot!\n\n"
+                "No public channels are available right now.\n"
+                "If you own a channel, use /addchannel to register it.\n"
+                "Use /mychannels to see the channels you manage."
+            )
+        else:
+            await message.answer(
+                "👋 Welcome to Auto-Link Bot!\n\n"
+                "No public channels are available right now.\n"
+                "Please try again later."
+            )
         return
 
     if len(channels) == 1:
         ch = channels[0]
-        link = ch.get("current_link")
-        if not link:
-            await message.answer(
-                "❌ Link not found for this channel yet. Please try again in a moment."
-            )
-            return
         kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(text="🚀 Join Channel", url=link)
+            InlineKeyboardButton(text="🚀 Join Channel", url=ch["current_link"])
         ]])
         await message.answer(
             f"👋 Welcome to Auto-Link Bot!\n\n"
             f"📢 Channel: {ch['title']}\n\n"
-            f"🔗 Current Link:\n{link}\n\n"
+            f"🔗 Current Link:\n{ch['current_link']}\n\n"
             f"👇 Click below to join!",
             reply_markup=kb,
             disable_web_page_preview=True,
@@ -167,24 +193,16 @@ async def view_channel(callback: types.CallbackQuery):
             {"visibility": {"$ne": "private"}},
         ],
     })
-    if not ch:
-        await callback.answer("Access denied.", show_alert=True)
-        return
-
-    link = ch.get("current_link")
-    if not link:
-        await callback.answer(
-            "❌ Link not found for this channel yet. Please try again in a moment.",
-            show_alert=True,
-        )
+    if not ch or not ch.get("current_link"):
+        await callback.answer("Channel not available.", show_alert=True)
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="🚀 Join Channel", url=link)
+        InlineKeyboardButton(text="🚀 Join Channel", url=ch["current_link"])
     ]])
     await callback.message.edit_text(
         f"📢 Channel: {ch['title']}\n\n"
-        f"🔗 Current Link:\n{link}\n\n"
+        f"🔗 Current Link:\n{ch['current_link']}\n\n"
         f"👇 Click below to join!",
         reply_markup=kb,
         disable_web_page_preview=True,
@@ -193,78 +211,38 @@ async def view_channel(callback: types.CallbackQuery):
 
 
 # ────────────────────────────────────────────────────────────────
-# /channels — browse every public channel
-# ────────────────────────────────────────────────────────────────
-
-@router.message(Command("channels"))
-async def cmd_channels(message: types.Message):
-    channels = await channels_col.find({
-        "enabled": True,
-        "visibility": {"$ne": "private"},
-    }).to_list(None)
-
-    if not channels:
-        await message.answer("No public channels available right now.")
-        return
-
-    # One inline button per channel — up to 20 fits comfortably on any screen.
-    buttons = [
-        [InlineKeyboardButton(text=ch["title"], url=ch["current_link"])]
-        for ch in channels
-        if ch.get("current_link")
-    ]
-    if not buttons:
-        await message.answer("Channels exist but no invite links are available yet.")
-        return
-
-    await message.answer(
-        "📢 <b>Available Public Channels</b>\n\nTap one to join:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        parse_mode="HTML",
-        disable_web_page_preview=True,
-    )
-
-
-# ────────────────────────────────────────────────────────────────
 # /help
 # ────────────────────────────────────────────────────────────────
 
 @router.message(Command("help"))
 async def cmd_help(message: types.Message):
+    if not await _role_gate(message):
+        return
+
     text = (
         "📖 <b>Auto-Link Bot — Command Reference</b>\n\n"
-        "👤 <b>Everyone</b>\n"
-        "/start — Show the current invite link(s)\n"
-        "/channels — List all public channels\n"
-        "/help — Show this help message\n"
-        "/mychannels — List channels you own or are assigned to\n"
-        "/status — Show status of the channels you manage\n\n"
-        "📢 <b>Channel Management</b> (owner or assigned admin)\n"
-        "/addchannel @username — Register a channel (public by default)\n"
+        "📢 <b>Channel Management</b>\n"
+        "/addchannel @username — Register a channel\n"
         "/addchannel -100xxxxxxxxxx — Register by chat ID\n"
-        "/removechannel CHAT_ID — Unregister a channel (owner only)\n"
-        "/settime CHAT_ID VALUE — Change rotation interval (5m / 10m / 1h / 24h / seconds)\n"
-        "/setlink CHAT_ID LINK — Manually override the link (owner only)\n"
-        "/setpublic CHAT_ID — Make a channel visible to everyone\n"
-        "/setprivate CHAT_ID — Hide a channel from non-owners/admins\n"
-        "/setshort CHAT_ID PREFIX — Enable short-link rotation with a prefix\n"
-        "/setrawlink CHAT_ID — Turn off short-link rotation\n\n"
+        "/removechannel CHAT_ID — Unregister (owner of that channel)\n"
+        "/settime CHAT_ID VALUE — Rotation interval (5m / 10m / 1h / 24h / seconds)\n"
+        "/setlink CHAT_ID LINK — Manual override (channel owner)\n"
+        "/setpublic CHAT_ID — Show to all users\n"
+        "/setprivate CHAT_ID — Hide from regular users\n"
+        "/setshort CHAT_ID PREFIX — Enable short-link rotation\n"
+        "/setrawlink CHAT_ID — Disable short-link rotation\n"
+        "/mychannels — Channels you manage\n"
+        "/status — Status of channels you manage\n\n"
     )
     if is_owner(message.from_user.id):
         text += (
             "👑 <b>Owner Only</b>\n"
-            "/addadmin USER_ID — Promote a user to admin\n"
-            "/removeadmin USER_ID — Demote an admin\n"
-            "/adminlist — List all admins\n"
-            "/dashboard — Bot statistics &amp; recent activity\n"
-            "/broadcast MESSAGE — Send a message to every registered user\n\n"
+            "/addadmin USER_ID\n"
+            "/removeadmin USER_ID\n"
+            "/adminlist\n"
+            "/dashboard\n"
+            "/broadcast MESSAGE\n\n"
         )
-    text += (
-        "🔗 <b>Quick start</b>\n"
-        "1. /addchannel @my_channel\n"
-        "2. /settime -1001234567890 10m\n"
-        "3. Share the bot → users send /start and see your link\n"
-    )
     await message.answer(text, parse_mode="HTML", disable_web_page_preview=True)
 
 
@@ -274,6 +252,8 @@ async def cmd_help(message: types.Message):
 
 @router.message(Command("broadcast"))
 async def cmd_broadcast(message: types.Message):
+    if not await _role_gate(message):
+        return
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Only the Owner can run this command.")
         return
@@ -320,6 +300,8 @@ async def cmd_broadcast(message: types.Message):
 
 @router.message(Command("addadmin"))
 async def cmd_addadmin(message: types.Message):
+    if not await _role_gate(message):
+        return
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Only the Owner can run this command.")
         return
@@ -334,6 +316,8 @@ async def cmd_addadmin(message: types.Message):
 
 @router.message(Command("removeadmin"))
 async def cmd_removeadmin(message: types.Message):
+    if not await _role_gate(message):
+        return
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Only the Owner can run this command.")
         return
@@ -348,6 +332,8 @@ async def cmd_removeadmin(message: types.Message):
 
 @router.message(Command("adminlist"))
 async def cmd_adminlist(message: types.Message):
+    if not await _role_gate(message):
+        return
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Only the Owner can run this command.")
         return
@@ -365,53 +351,49 @@ async def cmd_adminlist(message: types.Message):
 
 @router.message(Command("addchannel"))
 async def cmd_addchannel(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split(maxsplit=1)
     if len(parts) != 2:
         await message.answer("Usage: /addchannel @channelusername OR -100xxxxxxxxxx")
         return
-
     target = parts[1].strip()
     try:
         chat = await message.bot.get_chat(target)
     except Exception as e:
         await message.answer(f"❌ Could not fetch channel info: {e}")
         return
-
     if chat.type not in ("channel", "supergroup"):
         await message.answer("❌ The target must be a channel or supergroup.")
         return
-
     if await channels_col.find_one({"chat_id": chat.id}):
         await message.answer("❌ This channel is already registered.")
         return
-
     try:
         link_result = await message.bot.create_chat_invite_link(
             chat_id=chat.id,
             name=f"init-{int(datetime.now().timestamp())}",
-            creates_join_request=False,      # ← approval-free link
+            creates_join_request=False,
         )
     except Exception as e:
         await message.answer(f"❌ Could not create an invite link: {e}")
         return
-
     doc = {
         "chat_id": chat.id,
         "title": chat.title,
         "owner_id": message.from_user.id,
         "current_link": link_result.invite_link,
-        "raw_link": link_result.invite_link,          # ← raw for revocation
+        "raw_link": link_result.invite_link,
         "link_created_at": datetime.now(timezone.utc),
         "interval_seconds": 300,
         "enabled": True,
         "visibility": "public",
-        "short_prefix": None,                          # ← for short-link rotation
+        "short_prefix": None,
         "short_seq": 0,
         "assigned_admins": [],
     }
     await channels_col.insert_one(doc)
     add_rotation_job(message.bot, doc)
-
     await message.answer(
         f"✅ Channel added: <b>{chat.title}</b>\n"
         f"🔗 Initial link: {link_result.invite_link}\n"
@@ -426,6 +408,8 @@ async def cmd_addchannel(message: types.Message):
 
 @router.message(Command("removechannel"))
 async def cmd_removechannel(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
         await message.answer("Usage: /removechannel CHAT_ID")
@@ -445,12 +429,14 @@ async def cmd_removechannel(message: types.Message):
 
 @router.message(Command("mychannels"))
 async def cmd_mychannels(message: types.Message):
+    if not await _role_gate(message):
+        return
     channels = await channels_col.find({
         "$or": [{"owner_id": message.from_user.id},
                 {"assigned_admins": message.from_user.id}]
     }).to_list(None)
     if not channels:
-        await message.answer("You are not managing any channels yet.")
+        await message.answer("You are not managing any channels yet. Use /addchannel.")
         return
     lines = ["📋 <b>Your Channels</b>\n"]
     for ch in channels:
@@ -470,6 +456,8 @@ async def cmd_mychannels(message: types.Message):
 
 @router.message(Command("settime"))
 async def cmd_settime(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split()
     if len(parts) != 3:
         await message.answer("Usage: /settime CHAT_ID SECONDS\nShortcuts: 5m / 10m / 1h / 24h")
@@ -505,6 +493,8 @@ async def cmd_settime(message: types.Message):
 
 @router.message(Command("setlink"))
 async def cmd_setlink(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split(maxsplit=2)
     if len(parts) != 3:
         await message.answer("Usage: /setlink CHAT_ID NEW_LINK")
@@ -531,6 +521,8 @@ async def cmd_setlink(message: types.Message):
 
 @router.message(Command("setpublic"))
 async def cmd_setpublic(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
         await message.answer("Usage: /setpublic CHAT_ID")
@@ -546,6 +538,8 @@ async def cmd_setpublic(message: types.Message):
 
 @router.message(Command("setprivate"))
 async def cmd_setprivate(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
         await message.answer("Usage: /setprivate CHAT_ID")
@@ -561,15 +555,8 @@ async def cmd_setprivate(message: types.Message):
 
 @router.message(Command("setshort"))
 async def cmd_setshort(message: types.Message):
-    """
-    Enable short-link rotation.
-    Usage: /setshort CHAT_ID PREFIX
-    Example: /setshort -1002888391802 pw_yakeen_2_NEET_Lectures_2027
-    Each rotation will produce:
-      https://is.gd/<PREFIX>cl   (custom alias, 2-char suffix)
-      https://is.gd/<PREFIX>da
-      ...
-    """
+    if not await _role_gate(message):
+        return
     parts = message.text.split(maxsplit=2)
     if len(parts) != 3:
         await message.answer(
@@ -589,11 +576,8 @@ async def cmd_setshort(message: types.Message):
         await message.answer("⛔ Only the channel owner can configure short links.")
         return
     prefix = parts[2].strip()
-    if len(prefix) < 5 or len(prefix) > 20:
-        await message.answer(
-            "❌ Prefix must be between 5 and 20 characters "
-            "(is.gd requires 5–30, we cap at 20 to leave room for the suffix)."
-        )
+    if not (5 <= len(prefix) <= 20):
+        await message.answer("❌ Prefix must be 5–20 characters.")
         return
     await channels_col.update_one(
         {"chat_id": chat_id},
@@ -610,6 +594,8 @@ async def cmd_setshort(message: types.Message):
 
 @router.message(Command("setrawlink"))
 async def cmd_setrawlink(message: types.Message):
+    if not await _role_gate(message):
+        return
     parts = message.text.split()
     if len(parts) != 2 or not parts[1].lstrip("-").isdigit():
         await message.answer("Usage: /setrawlink CHAT_ID")
@@ -628,12 +614,14 @@ async def cmd_setrawlink(message: types.Message):
 
 @router.message(Command("status"))
 async def cmd_status(message: types.Message):
+    if not await _role_gate(message):
+        return
     channels = await channels_col.find({
         "$or": [{"owner_id": message.from_user.id},
                 {"assigned_admins": message.from_user.id}]
     }).to_list(None)
     if not channels:
-        await message.answer("You are not managing any channels yet.")
+        await message.answer("You are not managing any channels yet. Use /addchannel.")
         return
     lines = ["📊 <b>Channel Status</b>\n"]
     for ch in channels:
@@ -657,6 +645,8 @@ async def cmd_status(message: types.Message):
 
 @router.message(Command("dashboard"))
 async def cmd_dashboard(message: types.Message):
+    if not await _role_gate(message):
+        return
     if not is_owner(message.from_user.id):
         await message.answer("⛔ Only the Owner can access the Dashboard.")
         return
