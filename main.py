@@ -7,7 +7,7 @@ from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
 
 from config import BOT_TOKEN, PORT
-from database import ensure_indexes
+from database import ensure_indexes, shortlinks_col
 from scheduler import scheduler, restore_all_jobs
 import handlers_all
 
@@ -23,6 +23,31 @@ dp = Dispatcher()
 
 async def health(request):
     return web.Response(text="ok")
+
+
+async def redirect_short(request):
+    """
+    Handles GET /{alias} → 302 → the current Telegram link for that alias.
+    Also handles GET / → friendly landing page (not 404 anymore).
+    """
+    alias = request.match_info.get("alias")
+
+    # Landing page when alias is empty
+    if not alias:
+        return web.Response(
+            text="<h1>Auto-Link Bot</h1><p>Bot is running.</p>",
+            content_type="text/html",
+        )
+
+    doc = await shortlinks_col.find_one({"alias": alias})
+    if not doc:
+        return web.Response(
+            text="<h1>Link not found</h1><p>This short link does not exist or has expired.</p>",
+            content_type="text/html",
+            status=404,
+        )
+
+    raise web.HTTPFound(doc["target"])
 
 
 async def on_startup():
@@ -41,11 +66,14 @@ async def on_shutdown():
 async def main():
     app = web.Application()
     app.router.add_get("/health", health)
+    app.router.add_get("/", redirect_short)
+    app.router.add_get("/{alias}", redirect_short)
+
     runner = web.AppRunner(app)
     await runner.setup()
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
-    logger.info("Health server listening on port %d", PORT)
+    logger.info("Health + redirect server listening on port %d", PORT)
 
     await on_startup()
     try:
