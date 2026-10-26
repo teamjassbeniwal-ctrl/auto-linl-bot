@@ -22,6 +22,10 @@ def _suffix(seq: int) -> str:
 
 
 async def shorten(url: str, alias: str | None = None) -> tuple[str, str]:
+    """
+    Save alias → url in MongoDB and return the public short URL.
+    No third-party service — the bot's own Koyeb domain serves the redirect.
+    """
     if not alias:
         return url, "raw"
     await shortlinks_col.update_one(
@@ -35,10 +39,7 @@ async def shorten(url: str, alias: str | None = None) -> tuple[str, str]:
 async def rotate_link(bot: Bot, channel_snapshot: dict):
     """
     Rotate the invite link for one channel.
-
-    IMPORTANT: we re-read the channel from MongoDB at every tick, because the
-    snapshot passed in when the job was scheduled becomes stale after the first
-    run and would freeze short_seq at its initial value.
+    Re-reads the channel from MongoDB on every tick so short_seq always advances.
     """
     chat_id = channel_snapshot["chat_id"]
 
@@ -87,7 +88,7 @@ async def rotate_link(bot: Bot, channel_snapshot: dict):
         alias = f"{prefix}{_suffix(seq)}"
         display_link, provider = await shorten(raw_link, alias=alias)
 
-    # 4. Save — always increment based on the FRESH value we just read
+    # 4. Save
     new_seq = channel.get("short_seq", 0) + 1
     await channels_col.update_one(
         {"chat_id": chat_id},
